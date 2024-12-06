@@ -1,0 +1,313 @@
+image:
+  name: hashicorp/terraform:light
+  entrypoint:
+    - '/usr/bin/env'
+    - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+
+stages:
+  - loadscripts
+  - token
+  - testing
+  - plan
+  - deploy
+  - plan_prod
+  - eot
+  - deploy_prod
+  - RC
+  - teardown
+
+variables:
+  TF_ROOT: ${CI_PROJECT_DIR}
+  SRC_DIST: "itda-file-load-glue-jobs"
+  PY_SOURCE_DIR: "src/main/glue_job"
+  #"VERSION_MAJOR.VERSION_MINOR.VERSION_PATCH"
+  RELEASE_VERSION: "1.0.3"
+  COMPLIANCE_REPO: 'https://cicd.skyway.porsche.com/MARS/compliancereports/itda-file_load-glue-jobs'
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+      variables:
+        AWS_PROFILE: production
+        GLUE_BUCKET: s3://aws-glue-assets-165969252561-us-east-1/scripts/
+        ZIP_BUCKET: s3://aws-glue-assets-165969252561-us-east-1/scripts/
+        DOCKER_REGISTRY: 165969252561.dkr.ecr.us-east-1.amazonaws.com
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      variables:
+        AWS_PROFILE: production
+        GLUE_BUCKET: s3://aws-glue-assets-165969252561-us-east-1/scripts/
+        ZIP_LOCATION: s3://aws-glue-assets-165969252561-us-east-1/scripts/auto_key_rotation.zip
+        ZIP_BUCKET: s3://aws-glue-assets-165969252561-us-east-1
+        DOCKER_REGISTRY: 165969252561.dkr.ecr.us-east-1.amazonaws.com
+    - if: $CI_PIPELINE_SOURCE == 'web'
+      variables:
+        AWS_PROFILE: production
+        GLUE_BUCKET: s3://aws-glue-assets-165969252561-us-east-1/scripts/
+        ZIP_LOCATION: s3://aws-glue-assets-165969252561-us-east-1/scripts/auto_key_rotation.zip
+        ZIP_BUCKET: s3://aws-glue-assets-165969252561-us-east-1
+        DOCKER_REGISTRY: 165969252561.dkr.ecr.us-east-1.amazonaws.com
+    - if: $CI_COMMIT_TAG == $RELEASE_VERSION
+      variables:
+        AWS_PROFILE: production
+        GLUE_BUCKET: s3://aws-glue-assets-165969252561-us-east-1/scripts/
+        ZIP_BUCKET: s3://aws-glue-assets-165969252561-us-east-1/scripts/
+        DOCKER_REGISTRY: 165969252561.dkr.ecr.us-east-1.amazonaws.com
+    - when: always
+
+before_script:
+  - apk update
+  - apk add "zip" "unzip"
+  - apk add --update python3 py3-pip
+  - apk add --update openssl && rm -rf /var/cache/apk/*
+  - rm -rf .terraform
+  - terraform --version
+  - pip install awscli
+  - pip install --upgrade pip
+  - cd terraform/
+
+loadscripts_dev:
+  stage: loadscripts
+  variables:
+    ENVIRONMENT: development
+  script:
+    - echo $TF_ROOT
+    - ls ../src/main/glue_job/ > file_list.txt
+    - aws s3 cp file_list.txt $GLUE_BUCKET
+    - for script in $TF_ROOT/src/main/glue_job/*.py; do aws s3 cp "$script" $GLUE_BUCKET; done
+    - cd $TF_ROOT/src/main/lambda/
+    - zip -r glue_workflow_trigger.zip .
+    - aws s3 cp --content-type text/plain glue_workflow_trigger.zip $ZIP_BUCKET
+    - zip -r glue_workflow_trigger.zip.base64sha256 .
+    - aws s3 cp --content-type text/plain glue_workflow_trigger.zip.base64sha256 $ZIP_BUCKET
+
+  rules:
+    - if: $deploy == 'dev'
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+
+loadscripts_qa:
+  stage: loadscripts
+  script:
+    - apk update && apk add jq
+    - chmod +x aws-sso-login.sh
+    - source aws-sso-login.sh
+    - terraform init -backend-config qa/qa_backend.conf
+    - terraform validate
+    - terraform plan -var-file=qa/qa.tfvars -out "planfileqa"
+    - echo $TF_ROOT
+    - for script in $TF_ROOT/src/main/glue_job/*.py; do aws s3 cp "$script" s3://aws-glue-assets-851203502931-us-east-1/scripts/; done
+    - cd $TF_ROOT/src/main/lambda/
+    - zip -r auto_key_rotation.zip .
+    - aws s3 cp --content-type text/plain auto_key_rotation.zip $ZIP_BUCKET
+    - zip -r auto_key_rotation.zip.base64sha256 .
+    - aws s3 cp --content-type text/plain auto_key_rotation.zip.base64sha256 $ZIP_BUCKET
+  rules:
+    - if: $deploy == 'qa'
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+loadscripts_prod:
+  stage: loadscripts
+  variables:
+    ENVIRONMENT: development
+  script:
+    - echo $TF_ROOT
+    - for script in $TF_ROOT/src/main/glue_job/*.py; do aws s3 cp "$script" $GLUE_BUCKET; done
+    # - cd $TF_ROOT/src/main/lambda/
+    # - zip -r glue_workflow_trigger.zip .
+    # - aws s3 cp --content-type text/plain glue_workflow_trigger.zip $ZIP_BUCKET
+    # - zip -r auto_key_rotation.zip.base64sha256 .
+    # - aws s3 cp --content-type text/plain glue_workflow_trigger.zip.base64sha256 $ZIP_BUCKET
+  rules:
+    - if: $deploy == 'prod'
+    - if: $CI_COMMIT_TAG == $RELEASE_VERSION
+      when: manual
+
+token:
+  image:
+    name: amazon/aws-cli
+    entrypoint: [""]
+  dependencies:
+    - loadscripts_dev
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == 'web'
+    - if: $CI_COMMIT_TAG == $RELEASE_VERSION
+  stage: token
+  before_script:
+    - aws --version
+  script:
+    - USER=AWS
+    - TOKEN=$(aws ecr get-login-password)
+    - AUTH=$(echo "$USER:$TOKEN" | base64 | tr -d "\n")
+    - |
+      curl --request PUT --header "PRIVATE-TOKEN: $PERSONALGITLABTOKEN" \
+      "https://cicd.skyway.porsche.com/api/v4/groups/mars/variables/AWS_ECR_AUTH" \
+      --form "value=$AUTH" --output token.txt
+
+terrascan:
+  image:
+    name: $DOCKER_REGISTRY/itda-terrascan:latest
+    entrypoint: ["/bin/sh", "-c"]
+  stage: testing
+  script:
+    - terrascan scan -t aws -v --skip-rules="AC_AWS_0486,AC_AWS_0484,AC_AWS_0483" --non-recursive --iac-type="terraform" .
+  rules:
+    - if: $CI_COMMIT_TAG == $RELEASE_VERSION
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == 'web'
+
+unit_testing:
+  stage: testing
+  script:
+    - pip install -r $TF_ROOT/requirements.txt
+    - coverage run -m pytest $TF_ROOT/src/main/
+    - coverage report
+  rules:
+    - if: $CI_COMMIT_TAG == $RELEASE_VERSION
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == 'web'
+
+.terraform_plan_dev:
+  script:
+    - terraform init -backend-config development/dev_backend.conf
+    - terraform validate
+    - terraform plan -var-file=development/development.tfvars -out "planfile"
+
+plan_dev:
+  stage: plan
+  extends: .terraform_plan_dev
+  variables:
+    ENVIRONMENT: development
+  artifacts:
+    paths:
+      - $TF_ROOT/terraform/planfile
+  rules:
+    - if: $deploy == 'dev'
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+
+.terraform_plan_prod:
+  script:
+    - echo $AWS_PROFILE
+    - terraform init -backend-config production/prod_backend.conf
+    - terraform validate
+    - terraform plan -var-file=production/production.tfvars -out "planfileprod"
+
+plan_prod:
+  stage: plan_prod
+  extends: .terraform_plan_prod
+  variables:
+    ENVIRONMENT: production
+  artifacts:
+    paths:
+      - $TF_ROOT/terraform/planfileprod
+  rules:
+    - if: $deploy == 'prod'
+    - if: $CI_COMMIT_TAG == $RELEASE_VERSION
+
+
+.terraform_deploy_dev:
+  script:
+    - terraform init -backend-config development/dev_backend.conf
+    - terraform -chdir=$TF_ROOT/terraform/ apply -input=false "planfile"
+
+deploy_dev:
+  stage: deploy
+  extends: .terraform_deploy_dev
+  variables:
+    ENVIRONMENT: development
+  dependencies:
+    - plan_dev
+  rules:
+    - if: $deploy == 'dev'
+      when: manual
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+
+.terraform_deploy_prod:
+  script:
+    - terraform init -backend-config production/prod_backend.conf
+    - terraform -chdir=$TF_ROOT/terraform/ apply -input=false "planfileprod"
+
+deploy_prod:
+  stage: deploy_prod
+  extends: .terraform_deploy_prod
+  variables:
+    ENVIRONMENT: development
+  dependencies:
+    - plan_prod
+  rules:
+    - if: $deploy == 'prod'  
+    - if: $CI_COMMIT_TAG == $RELEASE_VERSION
+      when: manual
+
+.terraform_plan_qa:
+  script:
+    - apk update && apk add jq
+    - chmod +x aws-sso-login.sh
+    - source aws-sso-login.sh
+    - terraform init -backend-config qa/qa_backend.conf
+    - terraform validate
+    - terraform plan -var-file=qa/${ENVIRONMENT}.tfvars -out "planfileqa"
+
+plan_qa:
+  stage: plan
+  extends: .terraform_plan_qa
+  variables:
+    ENVIRONMENT: qa
+  artifacts:
+    paths:
+      - $TF_ROOT/terraform/planfileqa
+  rules:
+    - if: $deploy == 'qa'
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+.terraform_deploy_qa:
+  script:
+    - apk update && apk add jq
+    - chmod +x aws-sso-login.sh
+    - source aws-sso-login.sh
+    - terraform init -backend-config qa/qa_backend.conf
+    - terraform -chdir=$TF_ROOT/terraform/ apply -input=false "planfileqa"
+
+deploy_qa:
+  stage: deploy
+  extends: .terraform_deploy_qa
+  variables:
+    ENVIRONMENT: qa
+  dependencies:
+    - plan_qa
+  rules:
+    - if: $deploy == 'qa'
+      when: manual
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+
+create_RC:
+  stage: RC
+  before_script:
+    - git config --global user.name "woodkr"
+    - git config --global user.email "${GITLAB_USER_EMAIL}"
+  script:
+    - set -e
+    - RC_VERSION=$RELEASE_VERSION
+    - git tag -a $RELEASE_VERSION -m "Creating Release Candidate $RELEASE_VERSION"
+    - git push https://MyPersonalGitlabToken:$GITLAB_TOKEN_KEY@cicd.skyway.porsche.com/MARS/pcna_itda_snowflake_migration_project/itda_file_load_glue_jobs $RELEASE_VERSION
+  rules:
+    - if: $CI_COMMIT_TAG =~ /\d+\.\d+\.\d+\d+/
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+    - if: $destroy == 'yes'
+      when: never
+
+teardown:
+  stage: teardown
+  script:
+    - terraform init -backend-config development/dev_backend.conf
+    - terraform plan -destroy -var-file=development/development.tfvars -out "planfile"
+    - terraform -chdir=$TF_ROOT/terraform/ apply -input=false -destroy "planfile"
+  rules:
+    - if: $destroy == 'yes'
+      when: manual
